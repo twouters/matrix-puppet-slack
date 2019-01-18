@@ -3,6 +3,8 @@ const Promise = require('bluebird');
 const EventEmitter = require('events').EventEmitter;
 const { WebClient, RtmClient, CLIENT_EVENTS } = require('@slack/client');
 const { download } = require('./utils');
+const fs = require('fs');
+const stream = require('stream');
 
 class Client extends EventEmitter {
   constructor(token) {
@@ -92,9 +94,14 @@ class Client extends EventEmitter {
             this.data.users.push(data.user);
             break;
           case 'user_change':
-            {
+            if (!data.user) {
+                debug('something weird with user_change: ', data);
+            } else {
               let found = false;
               for (let i = 0; i < this.data.users.length; i++) {
+                if (!this.data.users[i]) {
+                  continue;
+                }
                 if (this.data.users[i].id == data.user.id) {
                   this.data.users[i] = data.user;
                   found = true;
@@ -159,29 +166,107 @@ class Client extends EventEmitter {
    * }
    **/
   getBotById(id) {
-    return this.data.bots.find(u => (u.id === id || u.name === id)) || { name: "unknown" };
+    // Get unknown bots from Slack
+    return new Promise((resolve, reject) => {
+        let bot = this.data.bots.find(u => u.id === id);
+        if (bot) {
+            resolve(bot);
+        } else {
+            return this.web.bots.info(id)
+                .then((res) => {
+                    this.data.bots.push(res.bot);
+                    resolve(res.bot);
+                }).catch((err) => {
+                    reject(err);
+                });
+        }
+    });
   }
   getUserById(id) {
-    return this.data.users.find(u => (u.id === id || u.name === id));
+    // Get unknown users from Slack
+    return new Promise((resolve, reject) => {
+        let user = this.data.users.find(u => u.id === id);
+        if (user) {
+            resolve(user);
+        } else {
+            return this.web.users.info(id)
+                .then((res) => {
+                    this.data.users.push(res.user);
+                    resolve(res.user);
+                }).catch((err) => {
+                    reject(err);
+                });
+        }
+    });
   }
   getChannelById(id) {
-    const chan = this.getRoomById(id);
-    if (!chan || chan.isDirect) {
-      return null;
-    }
-    return chan;
+    // Get unknown channels from Slack
+    return new Promise((resolve, reject) => {
+        let channel = this.data.channels.find(c => c.id === id);
+        if (channel) {
+            resolve(channel);
+        } else {
+            return this.web.channels.info(id)
+                .then((res) => {
+                    this.data.channels.push(res.channel);
+                    resolve(res.channel);
+                }).catch((err) => {
+                    reject(err);
+                });
+        }
+    });
+  }
+  getConversationById(id) {
+    // Get unknown conversations from Slack
+    return new Promise((resolve, reject) => {
+        let chan = this.data.channels.find(c => c.id === id);
+        if (chan) {
+            if (chan.is_im === undefined) {
+                chan.is_im = false;
+            }
+            if (chan.isDirect === undefined) {
+                chan.isDirect = chan.is_im;
+            }
+            resolve(chan);
+        } else {
+            let im = this.data.ims.find(c => c.id === id);
+            if (im) {
+                if (im.is_im === undefined) {
+                    im.is_im = true;
+                }
+                if (im.isDirect === undefined) {
+                    im.isDirect = im.is_im;
+                }
+                resolve(im);
+            } else {
+                return this.web.conversations.info(id)
+                    .then((res) => {
+                        if (res.channel.isDirect === undefined) {
+                            res.channel.isDirect = res.channel.is_im;
+                        }
+                        if (res.channel.is_im) {
+                            this.data.ims.push(res.channel);
+                        } else {
+                            this.data.channels.push(res.channel);
+                        }
+                        return res.channel;
+                    }).catch((err) => {
+                        reject(err);
+                    });
+            }
+        }
+    });
   }
   // get "room" by id will check for channel or IM and hide the details of that difference
   // but pass that detail along in case the callee cares.
   getRoomById(id) {
-    const chan = this.data.channels.find(c => (c.id === id || c.name === id));
-    if (!chan) {
-      return null;
-    }
-    if (chan.isDirect === undefined) {
-      chan.isDirect = !!chan.is_im;
-    }
-    return chan;
+    return this.getConversationById(id)
+      .then((res) => {
+          return res;
+      }).catch((err) => {
+          console.log(err);
+          return err;
+      });
   }
   sendMessage(text, channel) {
     return this.rtm.sendMessage(text, channel);
@@ -216,13 +301,22 @@ class Client extends EventEmitter {
         return this.web.files.upload(filename, opts, (err, res) => {
           err ? reject(err) : resolve(res);
         });
+      }).catch((err) => {
+        console.log(err);
       });
     });
+  }
+  downloadMatrixFile(url) {
+    return ;
   }
   downloadImage(url) {
     return download.getBufferAndType(url, {
       headers: { Authorization: 'Bearer ' +  this.token}
     });
+  }
+  openIm(user) {
+    console.log('getting im for ' + user);
+    return this.web.im.open(user);
   }
 }
 

@@ -16,6 +16,8 @@ if (!module.parent) {
   var md = slackdown(app, 'Card moved: "<https://trello.com/c/z1m8Yndl|ignore this card! testing slack&lt;-&gt;matrix bridge with respect to trello>" from list "Doing" to list "ToDo"')
   var showdown  = require('showdown');
   var converter = new showdown.Converter();
+  converter.setOption('omitExtraWLInCodeBlocks', true);
+  converter.setOption('strikethrough', true);
   var html      = converter.makeHtml(md);
   console.log(html);
 } else {

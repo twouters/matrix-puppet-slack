@@ -8,7 +8,9 @@ const showdown  = require('showdown');
 const emojione = require('emojione')
 const converter = new showdown.Converter({
   literalMidWordUnderscores : true,
-  simpleLineBreaks: true
+  simpleLineBreaks: true,
+  strikethrough: true,
+  omitExtraWLInCodeBlocks: true
 });
 
 class App extends MatrixPuppetBridgeBase {
@@ -57,86 +59,94 @@ class App extends MatrixPuppetBridgeBase {
     })
   }
   registerMessageListener() {
+    this.client.on('user_typing', (data)=>{
+        if (data.channel && data.user) {
+            this.sendTyping(data, true);
+        } else {
+            debug('Not sending typing event', data);
+        }
+    });
     this.client.on('message', (data)=>{
-      console.log(data);
-      // edit message
       if (data.subtype === "message_changed") {
         if (data.message.text === data.previous_message.text) {
           // do nothing
           debug('ignoring duplicate edit', data);
-          return;
+        } else {
+          this.createAndSendPayload({
+            channel: data.channel,
+            text: `Edit: ${data.message.text}`,
+            user: data.message.user
+          });
         }
+      } else if (data.subtype === 'message_deleted') {
         this.createAndSendPayload({
           channel: data.channel,
-          text: `Edit: ${data.message.text}`,
-          user: data.message.user
+          text: `Deleted: ${data.previous_message.text}`,
+          user: 'USLACKBOT', // message_deleted doesn't contain message.user
         });
-        return;
-      }
-      if (data.files) {
-        const promises = [];
-        if (data.text) {
-          promises.push(this.createAndSendPayload({
+      } else if (data.subtype === 'message_replied') {
+          // do nothing
+          debug('ignoring message replied event', data);
+      } else {
+        if (data.files && data.files.length > 0) {
+          for (let i = 0; i < data.files.length; i++) {
+            debug('file round: ', i)
+            data.file = data.files[i];
+            this.sendFile(data).then(() => {
+              if (data.text != '') {
+                this.createAndSendPayload({
+                  channel: data.channel,
+                  text: data.text,
+                  attachments: data.attachments,
+                  bot_id: data.bot_id,
+                  user: data.user,
+                  user_profile: data.user_profile,
+                });
+              }
+            });
+          }
+        } else {
+          this.createAndSendPayload({
             channel: data.channel,
             text: data.text,
             attachments: data.attachments,
             bot_id: data.bot_id,
             user: data.user,
             user_profile: data.user_profile,
-          }));
-        }
-        data.files.forEach((file) => {
-          const d = {
-            channel: data.channel,
-            text: data.text,
-            attachments: data.attachments,
-            bot_id: data.bot_id,
-            user: data.user,
-            user_profile: data.user_profile,
-            file: file,
-          };
-          promises.push(this.sendFile(d).then(() => {
-            if (d.file.initial_comment) {
-              return this.createAndSendPayload({
-                channel: d.channel,
-                text: d.file.initial_comment.comment,
-                attachments: d.attachments,
-                bot_id: d.bot_id,
-                user: d.user,
-                user_profile: d.user_profile,
-              });
-            }
-          }));
-        });
-        Promise.all(promises).catch(err=>{
-          console.error(err);
-          this.sendStatusMsg({
-            fixedWidthOutput: true,
-            roomAliasLocalPart: `${this.slackPrefix}_${this.getStatusRoomPostfix()}`
-          }, err.stack).catch((err)=>{
-            console.error(err);
           });
-        });
-        return;
+        }
       }
-      // normal message
-      this.createAndSendPayload({
-        channel: data.channel,
-        text: data.text,
-        attachments: data.attachments,
-        bot_id: data.bot_id,
-        user: data.user,
-        user_profile: data.user_profile,
-      });
-    });
-    this.client.on('typing', (data)=>{
-      console.log(data);
-      this.createAndSendTypingEvent({
-        channel: data.channel,
-        user: data.user,
-      });
     });
     debug('registered message listener');
+  }
+  sendTyping(data, isTyping) {
+      const { channel, user } = data;
+      if (user && user === this.client.getSelfUserId()) {
+        return new Promise((resolve, reject)=>{
+            resolve();
+        });
+      }
+      return this.getOrCreateMatrixRoomFromThirdPartyRoomId(channel).then((roomId) => {
+          return this.getIntentFromThirdPartySenderId(user).then((intent) => {
+              return intent.sendTyping(roomId, isTyping).then(() => {
+                  if (typeof this.typing === 'undefined') {
+                      this.typing = [];
+                  }
+                  var index;
+                  if (isTyping && this.typing.indexOf(channel+user)) {
+                      this.typing.push(channel+user);
+                  } else if (!isTyping && (index = this.typing.indexOf(channel+user)) > -1) {
+                      this.typing = this.typing.slice(index);
+                  }
+              }).catch((err) => {
+                  debug('failed to send typing event', err);
+              });
+          }).catch((err) => {
+              debug('failed to get intent', err);
+          })
+      }).catch((err) => {
+          debug(err);
+      });
   }
   getPayload(data) {
     const {
@@ -148,48 +158,177 @@ class App extends MatrixPuppetBridgeBase {
       user_profile,
       file,
     } = data;
-    let payload = { roomId: channel };
+
+    let payload = {
+      roomId: channel,
+      senderId: undefined
+    };
 
     if (user) {
-      if ( user === "USLACKBOT" ) {
-        const u = this.client.getUserById(user);
-        payload.senderName = u.name;
-        payload.senderId = user;
-        payload.avatarUrl = u.profile.image_72;
-      } else {
-        const isMe = user === this.client.getSelfUserId();
-        let uu = this.client.getUserById(user);
-        payload.senderId = isMe ? undefined : user;
-        if (uu) {
-          payload.senderName = uu.name;
-          payload.avatarUrl = uu.profile.image_512;
-        } else {
-          payload.senderName = "unknown";
-        }
-      }
+      const isMe = user === this.client.getSelfUserId();
+      payload.senderId = isMe ? undefined : user;
+      return this.client.getUserById(user)
+        .then((uu) => {
+            payload.senderName = uu.name;
+            payload.avatarUrl = uu.profile.image_512;
+            return payload;
+        }).catch((err) => {
+            console.log(err);
+            payload.senderName = 'unknown';
+            return payload;
+        });
     } else if (bot_id) {
-      const bot = this.client.getBotById(bot_id);
-      payload.senderName = bot.name;
-      payload.senderId = bot_id;
-      payload.avatarUrl = bot.icons.image_72
+      return this.client.getBotById(bot_id)
+        .then((bot) => {
+            payload.senderName = bot.name;
+            payload.senderId = bot_id;
+            payload.avatarUrl = bot.icons.image_72
+            return payload;
+        }).catch((err) => {
+            console.log(err);
+            payload.senderName = 'unknown';
+            return payload;
+        });
+    } else {
+        console.log(payload);
+        return new Promise((resolve, reject)=>{
+            resolve(payload);
+        });
     }
-    return payload;
   }
   sendFile(data) {
-    let payload = this.getPayload(data);
-    payload.text = data.file.name;
-    payload.url = ''; // to prevent errors
-    payload.path = ''; // to prevent errors
-    return this.client.downloadImage(data.file.url_private).then(({ buffer, type }) => {
-      payload.buffer = buffer;
-      payload.mimetype = type;
-      return this.handleThirdPartyRoomImageMessage(payload);
-    }).catch((err) => {
-      console.log(err);
-      payload.text = '[Image] ('+data.name+') '+data.url;
-      return this.handleThirdPartyRoomMessage(payload);
+    return this.getPayload(data).then((payload) => {
+      payload.text = data.file.name;
+      payload.url = ''; // to prevent errors
+      payload.path = ''; // to prevent errors
+      payload.file = data.file;
+      return this.client.downloadImage(data.file.url_private).then(({ buffer, type }) => {
+        payload.buffer = buffer;
+        payload.mimetype = type;
+        return this.handleThirdPartyRoomFileMessage(payload);
+      }).catch((err) => {
+        console.log(err);
+        payload.text = '[Image] ('+data.name+') '+data.url;
+        return this.handleThirdPartyRoomMessage(payload);
+      });
     });
   }
+
+  handleThirdPartyRoomFileMessage(thirdPartyRoomFileMessageData) {
+    debug('handling third party room file message', thirdPartyRoomFileMessageData);
+    let {
+      roomId,
+      senderName,
+      senderId,
+      avatarUrl,
+      text,
+      url, path, buffer, // either one is fine
+      h,
+      w,
+      mimetype,
+      file
+    } = thirdPartyRoomFileMessageData;
+
+    if (mimetype && mimetype.split('/')[0] === 'image') {
+      return this.handleThirdPartyRoomImageMessage(thirdPartyRoomFileMessageData);
+    }
+
+    return this.getOrCreateMatrixRoomFromThirdPartyRoomId(roomId).then((matrixRoomId) => {
+      return this.getUserClient(matrixRoomId, senderId, senderName, avatarUrl).then((client) => {
+        if (senderId === undefined) {
+          debug("this message was sent by me, but did it come from a matrix client or a 3rd party client?");
+          debug("if it came from a 3rd party client, we want to repeat it as a 'notice' type message");
+          debug("if it came from a matrix client, then it's already in the client, sending again would dupe");
+          debug("we use a tag on the end of messages to determine if it came from matrix");
+
+          if (typeof text === 'undefined') {
+            debug("we can't know if this message is from matrix or not, so just ignore it");
+            return;
+          }
+          else if (this.isTaggedMatrixMessage(text) || (path && isFilenameTagged(path))) {
+            debug('it is from matrix, so just ignore it.');
+            return;
+          } else {
+            debug('it is from 3rd party client');
+          }
+        }
+
+        let upload = (buffer, opts) => {
+          return client.uploadContent(buffer, Object.assign({
+            name: text,
+            type: mimetype,
+            rawResponse: false
+          }, opts || {})).then((res)=>{
+            return {
+              content_uri: res.content_uri || res,
+              size: buffer.length
+            };
+          });
+        };
+
+        let promise;
+        if ( url ) {
+          promise = ()=> {
+            return download.getBufferAndType(url).then(({buffer,type}) => {
+              return upload(buffer, { type: mimetype || type });
+            });
+          };
+        } else if ( path ) {
+          promise = () => {
+            return Promise.promisify(fs.readFile)(path).then(buffer => {
+              return upload(buffer);
+            });
+          };
+        } else if ( buffer ) {
+          promise = () => upload(buffer);
+        } else {
+          promise = Promise.reject(new Error('missing url or path'));
+        }
+
+        promise().then(({ content_uri, size }) => {
+          debug('uploaded to', content_uri);
+          let file_opts = {
+            body: (senderId === undefined) ? this.tagMatrixMessage(file.title) : file.title,
+            filename: file.name,
+            info: {
+              mimetype: mimetype,
+              size: size,
+            },
+            msgtype: "m.file",
+            url: content_uri
+          };
+          if (file.mode === 'post' || file.mode === 'snippet') {
+            let html = converter.makeHtml(
+              '```' + file.filetype + '\n' + file.preview + '\n```' + ((file.lines_more > 0) ? '*truncated*' : '')
+            );
+            debug('about to send message', html, file.preview);
+
+            let opts = {
+              body: (senderId === undefined) ? this.tagMatrixMessage(file.preview) : file.preview,
+              format: "org.matrix.custom.html",
+              formatted_body: html,
+              msgtype: "m.text"
+            }
+            return client.sendMessage(matrixRoomId, opts).then(()=>{
+              return client.sendMessage(matrixRoomId, file_opts);
+            }).catch((err)=>{
+              debug('failed to post message', err);
+            });
+          }
+          return client.sendMessage(matrixRoomId, file_opts);
+        }, (err) =>{
+          warn('upload error', err);
+
+          let opts = {
+            body: (senderId === undefined) ? this.tagMatrixMessage(texturl || path || text) : texturl || path || text,
+            msgtype: "m.text"
+          };
+          return client.sendMessage(matrixRoomId, opts);
+        });
+      });
+    });
+  }
+
   createAndSendPayload(data) {
     const {
       channel,
@@ -268,124 +407,108 @@ class App extends MatrixPuppetBridgeBase {
 
     let rawMessage =
       messages
+        .map(m => (typeof m === "string") ? m.trim() : m)
         .filter(m => m && (typeof m === "string"))
-        .map(m => m.trim())
         .join('\n')
         .trim();
-    let payload = this.getPayload(data);
 
-    try {
-      const replacements = [
-        [':+1:', ':thumbsup:'],
-        [':-1:', ':thumbsdown:'],
-        [':facepunch:', ':punch:'],
-        [':hankey:', ':poop:'],
-        [':slightly_smiling_face:', ':slight_smile:'],
-        [':upside_down_face:', ':upside_down:'],
-        [':skin-tone-2:', '🏻'],
-        [':skin-tone-3:', '🏼'],
-        [':skin-tone-4:', '🏽'],
-        [':skin-tone-5:', '🏾'],
-        [':skin-tone-6:', '🏿'],
-        ['<!channel>', '@room'],
-        ['<!here>', '@room'],
-          // NOTE: <!channel> and `<!here> converted to @room here,
-          // and not in slacktomd, because we're translating Slack parlance
-          // to Matrix parlance, not parsing "Slackdown" to turn into Markdown.
-      ];
-      for (let i = 0; i < replacements.length; i++) {
-        rawMessage = rawMessage.replace(replacements[i][0], replacements[i][1]);
-      }
-      rawMessage = emojione.shortnameToUnicode(rawMessage);
-      console.log("rawMessage");
-      console.log(rawMessage);
-      payload.text = slackdown(this, rawMessage);
-      let markdown = payload.text;
-      markdown = markdown.replace(/;BEGIN_FONT_COLOR_HACK_(.*?);/g, '<font color="$1">');
-      markdown = markdown.replace(/;END_FONT_COLOR_HACK;/g, '</font>');
-      payload.text = payload.text.replace(/;BEGIN_FONT_COLOR_HACK_(.*?);/g, '');
-      payload.text = payload.text.replace(/;END_FONT_COLOR_HACK;/g, '');
-
-      // Replace a slack user mention.
-      // In the body it should be replaced with the nick and in the html a href.
-
-      let result = [];
-      while ((result = /USER_MENTION_HACK(.*?)END_USER_MENTION_HACK/g.exec(payload.text)) !== null) {
-        console.log(result);
-        const u = result[1];
-        const isme = u === this.client.getSelfUserId();
-        const user = this.client.getUserById(u);
-        if (user) {
-            const id = isme ? config.puppet.id : this.getGhostUserFromThirdPartySenderId(u);
-            // todo: update user profile
-            const name = isme ? config.puppet.localpart : user.name;
-            const mentionmd = `[${name}](https://matrix.to/#/${id})`;
-            payload.text = payload.text.replace(result[0], name);
-            markdown = markdown.replace(result[0], mentionmd);
-        } else {
-            payload.text = payload.text.replace(result[0], u);
-            markdown = markdown.replace(result[0], u);
-
+    return this.getPayload(data).then((payload) => {
+      try {
+        const replacements = [
+          [':+1:', ':thumbsup:'],
+          [':-1:', ':thumbsdown:'],
+          [':facepunch:', ':punch:'],
+          [':hankey:', ':poop:'],
+          [':slightly_smiling_face:', ':slight_smile:'],
+          [':upside_down_face:', ':upside_down:'],
+          [':skin-tone-2:', '🏻'],
+          [':skin-tone-3:', '🏼'],
+          [':skin-tone-4:', '🏽'],
+          [':skin-tone-5:', '🏾'],
+          [':skin-tone-6:', '🏿'],
+          ['<!channel>', '@room'],
+          ['<!here>', '@room'],
+            // NOTE: <!channel> and `<!here> converted to @room here,
+            // and not in slacktomd, because we're translating Slack parlance
+            // to Matrix parlance, not parsing "Slackdown" to turn into Markdown.
+        ];
+        for (let i = 0; i < replacements.length; i++) {
+          rawMessage = rawMessage.replace(replacements[i][0], replacements[i][1]);
         }
+        rawMessage = emojione.shortnameToUnicode(rawMessage);
+        console.log("rawMessage");
+        console.log(rawMessage);
+        payload.text = slackdown(rawMessage, this);
+        let markdown = payload.text;
+        markdown = markdown.replace(/;BEGIN_FONT_COLOR_HACK_(.*?);/g, '<font color="$1">');
+        markdown = markdown.replace(/;END_FONT_COLOR_HACK;/g, '</font>');
+        payload.text = payload.text.replace(/;BEGIN_FONT_COLOR_HACK_(.*?);/g, '');
+        payload.text = payload.text.replace(/;END_FONT_COLOR_HACK;/g, '');
+
+        // Replace a slack user mention.
+        // In the body it should be replaced with the nick and in the html a href.
+
+        let result = [];
+        while ((result = /USER_MENTION_HACK(.*?)END_USER_MENTION_HACK/g.exec(payload.text)) !== null) {
+          console.log(result);
+          const u = result[1];
+          const isme = u === this.client.getSelfUserId();
+          const user = this.client.getUserById(u);
+          if (user) {
+              const id = isme ? config.puppet.id : this.getGhostUserFromThirdPartySenderId(u);
+              // todo: update user profile
+              const name = isme ? config.puppet.localpart : user.name;
+              const mentionmd = `[${name}](https://matrix.to/#/${id})`;
+              payload.text = payload.text.replace(result[0], name);
+              markdown = markdown.replace(result[0], mentionmd);
+          } else {
+              payload.text = payload.text.replace(result[0], u);
+              markdown = markdown.replace(result[0], u);
+
+          }
+        }
+        console.log("payload.text");
+        console.log(payload.text);
+        payload.html = converter.makeHtml(markdown);
+        console.log("payload.html");
+        console.log(payload.html);
+      } catch (e) {
+        console.log(e);
+        debug("could not normalize message", e);
+        payload.text = rawMessage;
       }
-      console.log("payload.text");
-      console.log(payload.text);
-      payload.html = converter.makeHtml(markdown);
-      console.log("payload.html");
-      console.log(payload.html);
-    } catch (e) {
-      console.log(e);
-      debug("could not normalize message", e);
-      payload.text = rawMessage;
-    }
 
-
-
-    return this.handleThirdPartyRoomMessage(payload).catch(err=>{
-      console.error(err);
-      this.sendStatusMsg({
-        fixedWidthOutput: true,
-        roomAliasLocalPart: `${this.slackPrefix}_${this.getStatusRoomPostfix()}`
-      }, err.stack).catch((err)=>{
-        console.error(err);
+      return this.sendTyping({channel: data.channel, user: data.user}, false).then(() => {
+          this.handleThirdPartyRoomMessage(payload).catch(err=>{
+              console.error(err);
+              this.sendStatusMsg({
+                  fixedWidthOutput: true,
+                  roomAliasLocalPart: `${this.slackPrefix}_${this.getStatusRoomPostfix()}`
+              }, err.stack).catch((err)=>{
+                  console.error(err);
+              });
+          });
       });
     });
   }
-  createAndSendTypingEvent(data) {
-    const payload = this.getPayload(data);
-    return this.getIntentFromThirdPartySenderId(payload.senderId).then(ghostIntent => {
-      return this.getOrCreateMatrixRoomFromThirdPartyRoomId(payload.roomId).then(matrixRoomId => {
-        // HACK: copy from matrix-appservice-bridge/lib/components/indent.js
-        // client can get timeout value, but intent does not support this yet.
-        //return ghostIntent.sendTyping(matrixRoomId, true);
-        return ghostIntent._ensureJoined(matrixRoomId).then(function() {
-          return ghostIntent._ensureHasPowerLevelFor(matrixRoomId, "m.typing");
-        }).then(function() {
-          return ghostIntent.client.sendTyping(matrixRoomId, true, 3000);
-        });
-      });
-    }).catch(err=>{
-      console.error(err);
-      this.sendStatusMsg({
-        fixedWidthOutput: true,
-        roomAliasLocalPart: `${this.slackPrefix}_${this.getStatusRoomPostfix()}`
-      }, err.stack).catch((err)=>{
-        console.error(err);
-      });
-    });
-  }
+
   getThirdPartyRoomDataById(id) {
-    const directName = (user) => this.client.getUserById(user).name;
     const directTopic = () => `Slack Direct Message (Team: ${this.teamName})`
-    const room = this.client.getRoomById(id);
-    var purpose = "";
-    if ((room.purpose) && room.purpose.value) {
-      purpose = room.purpose.value;
-    }
-    return {
-      name: room.isDirect ? directName(room.user) : room.name,
-      topic: room.isDirect ? directTopic() : purpose
-    }
+    return this.client.getRoomById(id).then((room) => {
+        if (room.is_im) {
+            return this.client.getUserById(room.user).then((user) => {
+                return {
+                    name: user.name,
+                    topic: directTopic()
+                };
+            });
+        } else {
+            return {
+                name: room.name,
+                topic: (typeof room.purpose === 'undefined') ? '' : room.purpose.value
+            };
+        }
+    });
   }
   sendReadReceiptAsPuppetToThirdPartyRoomWithId() {
     // not available for now
@@ -396,10 +519,6 @@ class App extends MatrixPuppetBridgeBase {
     let message;
     if (data.content.format === 'org.matrix.custom.html') {
       const rawMessage = data.content.formatted_body;
-
-      console.log("rawMessage");
-      console.log(rawMessage);
-
       message = mxtoslack(this, rawMessage);
     } else {
       message = data.content.body;
@@ -423,6 +542,47 @@ class App extends MatrixPuppetBridgeBase {
     // deduplicate
     const filename = this.tagMatrixMessage(data.filename);
     return this.client.sendFileMessage(data.url, data.text, filename, id);
+  }
+  initiateIm(data) {
+    const { room_id, state_key } = data;
+    const botIntent = this.getIntentFromApplicationServerBot();
+    const botClient = botIntent.getClient();
+    const puppet = this.puppet.getClient();
+    const puppetUserId = puppet.credentials.userId;
+    const botUserId = botClient.credentials.userId;
+    const directTopic = () => `Slack Direct Message (Team: ${this.teamName})`
+    const inviteBot = (room_id) => {
+      return puppet.invite(room_id, botUserId).then(() => {
+        return botIntent.join(room_id).then(() => {
+          }).catch((err) => {
+              debug('bot failed to join room', err);
+          });
+        })
+      };
+
+    var user = this.getThirdPartyUserIdFromMatrixGhostId(state_key);
+    return this.client.openIm(user).then((res) => {
+      let room = res.channel.id;
+      let roomAlias = this.getRoomAliasFromThirdPartyRoomId(room);
+      let roomAliasName = this.getRoomAliasLocalPartFromThirdPartyRoomId(room);
+      return inviteBot(room_id).then(() => {
+        return this.client.getUserById(user).then((slackuser) => {
+          return puppet.createAlias(roomAlias, room_id).then(() => {
+            puppet.setRoomName(room_id, slackuser.name).then(() => {
+              puppet.setRoomTopic(room_id, directTopic()).then(() => {
+                const ghostIntent = this.bridge.getIntent(this.getGhostUserFromThirdPartySenderId(user));
+                ghostIntent.join(room_id).catch((err) => {
+                  debug('failed to join user', err);
+                });
+              }).catch((err) => {
+                debug('failed to set topic', err);
+              });
+            }).catch((err) => { debug('failed to set room name', err); });
+            return roomAlias;
+          }).catch((err) => { debug('failed to add room alias', err); });
+        }).catch((err) => { debug('failed to get user', err); });
+      }).catch((err) => { debug('failed to create room', err); });
+    });
   }
 }
 

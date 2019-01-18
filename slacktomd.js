@@ -1,6 +1,8 @@
 "use strict";
 const config = require('./config.json');
 
+var he = require('he');
+
 class slacktomd {
   constructor() {
   }
@@ -37,23 +39,43 @@ class slacktomd {
     // but we delay the processing of the user id until app.js so that we can
     // seperate the handling of the plain text and formatted bodies.
     return `USER_MENTION_HACK${u}END_USER_MENTION_HACK`;
+    var retVal = null;
+    this.users.filter(username => {
+      if (username.id === 'U' + u) {
+        if (username.id != this.app.client.getSelfUserId()) {
+          var matrixuser = this.app.getGhostUserFromThirdPartySenderId(username.id);
+          retVal = '[' + username.name + '](https://matrix.to/#/' + matrixuser + ')';
+        } else {
+          var client = this.app.puppet.getClient();
+          retVal = '[' + client.getUserIdLocalpart() + '](https://matrix.to/#/' + client.getUserId() + ')';
+        }
+      }
+    })[0];
+    if (retVal) {
+      return retVal;
+    }
+    return u;
   }
 
   _getChannel(c) {
-    const chan = this.app.client.getChannelById(c);
-    if (chan) {
-      const id = this.app.getRoomAliasFromThirdPartyRoomId(c);
-      // update room profile
-      return `[${chan.name}](https://matrix.to/#/${id})`;
-    }
-    return c;
+    return this.app.client.getChannelById(c).then((chan) => {
+      if (chan) {
+        const id = this.app.getRoomAliasFromThirdPartyRoomId(c);
+        // update room profile
+        return `[${chan.name}](https://matrix.to/#/${id})`;
+      });
   }
 
-  _matchTag(match) {
+  _matchTag(match, block = 0) {
     var action = match[1].substr(0,1), p;
 
     switch(action) {
       case "!":
+        p = this._payloads(match[1], 1);
+        let b = p.length == 1 ? p[0] : p[1];
+        if (b === 'here') {
+            return '@room';
+        }
         return this._payloads(match[1]);
       case "#":
         p = this._payloads(match[1], 1);
@@ -64,7 +86,20 @@ class slacktomd {
         let u = p.length == 1 ? p[0] : p[1];
         return this._getUser(u);
       default:
+        var expression = /^([a-z0-9+.-]+):(?:\/\/(?:((?:[a-z0-9-._~!$&'()*+,;=:]|%[0-9A-F]{2})*)@)?((?:[a-z0-9-._~!$&'()*+,;=]|%[0-9A-F]{2})*)(?::(\d*))?(\/(?:[a-z0-9-._~!$&'()*+,;=:@\/]|%[0-9A-F]{2})*)?|(\/?(?:[a-z0-9-._~!$&'()*+,;=:@]|%[0-9A-F]{2})+(?:[a-z0-9-._~!$&'()*+,;=:@\/]|%[0-9A-F]{2})*)?)(?:\?((?:[a-z0-9-._~!$&'()*+,;=:\/?@]|%[0-9A-F]{2})*))?(?:#((?:[a-z0-9-._~!$&'()*+,;=:\/?@]|%[0-9A-F]{2})*))?$/i;
+        var regex = new RegExp(expression);
         p = this._payloads(match[1]);
+        if (block > 0) {
+          if (p.length > 1) {
+            if (p[0] == p[1] || p[0] == 'http://' + p[1]) {
+              return p[1];
+            }
+          }
+          if (p[0].match(regex)) {
+            return p[0];
+          }
+          return match[0];
+        }
         return this._markdownTag("href", p[0], (p.length == 1 ? p[0] : p[1]));
     }
   }
@@ -110,11 +145,11 @@ class slacktomd {
   }
 
   _matchFixed(match) {
-    return this._safeMatch(match, this._markdownTag("fixed", this._payloads(match[1])));
+    return this._safeMatch(match, this._markdownTag("fixed", he.decode(match[1])));
   }
 
   _matchBlockFixed(match) {
-    return this._safeMatch(match, this._markdownTag("blockFixed", this._payloads(match[1])));
+    return this._safeMatch(match, this._markdownTag("blockFixed", he.decode(match[1])));
   }
 
   _matchStrikeThrough(match) {
@@ -150,23 +185,31 @@ class slacktomd {
       return text;
     }
     var patterns = [
-      {p: /<(.*?)>/g, cb: "tag"},
-      {p: /\*([^\*]*?)\*/g, cb: "bold"},
-      {p: /_([^_]*?)_/g, cb: "italic"},
-      {p: /`([^`]*?)`/g, cb: "fixed"},
-      {p: /```([^`]*?)```/g, cb: "blockFixed"},
-      {p: /~([^~]*?)~/g, cb: "strikeThrough"}
+      {p: new RegExp('```([^`]+)```', 'g'), cb: "blockFixed"},
+      {p: new RegExp('`([^`]+)`', 'g'), cb: "fixed"},
+      {p: new RegExp('<([^>]+)>', 'g'), cb: "tag"},
+      {p: new RegExp('\\*([^\\*]+)\\*', 'g'), cb: "bold"},
+      {p: new RegExp('_([^_]+)_', 'g'), cb: "italic"},
+      {p: new RegExp('~([^~]+)~', 'g'), cb: "strikeThrough"}
     ];
 
+    let blocks = [];
     for (let p = 0; p < patterns.length; p++) {
       let pattern = patterns[p],
           original = text,
           result, replace;
 
       while ((result = pattern.p.exec(original)) !== null) {
+        let lastIndex = pattern.p.lastIndex;
+        let b;
         switch(pattern.cb) {
           case "tag":
-            replace = this._matchTag(result);
+            if ((b = blocks.findIndex(e => e.start < result.index)) > -1
+              && lastIndex < blocks[b].end) {
+              replace = this._matchTag(result, 1);
+            } else {
+              replace = this._matchTag(result);
+            }
             break;
           case "bold":
             replace = this._matchBold(result);
@@ -175,9 +218,11 @@ class slacktomd {
             replace = this._matchItalic(result);
             break;
           case "fixed":
+            blocks.push({start: result.index, end: lastIndex});
             replace = this._matchFixed(result);
             break;
           case "blockFixed":
+            blocks.push({start: result.index, end: lastIndex});
             replace = this._matchBlockFixed(result);
             break;
           case "strikeThrough":
@@ -197,6 +242,8 @@ class slacktomd {
   }
 
   parse(app, text) {
+    this.users = app.client.getUsers();
+    this.channels = app.client.getChannels();
     this.app = app;
     return this._publicParse(text);
   }

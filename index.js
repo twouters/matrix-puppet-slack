@@ -35,6 +35,7 @@ new Cli({
     let teamAppList = [];
 
     let matrixRoomAppMap = {};
+    let matrixUserAppMap = {};
 
     // KINDA BAD because you might have 2 accounts that are in the same room
     // although that would be silly, right?
@@ -47,14 +48,43 @@ new Cli({
           let ret = teamAppList.reduce((acc, app)=>{
             if ( acc ) return acc;
             let slackRoomId = app.getThirdPartyRoomIdFromMatrixRoomId(room_id);
-            let slackRoom = app.client.getRoomById(slackRoomId);
-            if (slackRoom) {
-              debug('getting app from slack room', slackRoom);
-              matrixRoomAppMap[room_id] = app;
-              return app;
+            if (slackRoomId) {
+                return app.client.getRoomById(slackRoomId)
+                    .then((room) => {
+                        debug('getting app from slack room');
+                        matrixRoomAppMap[room_id] = app;
+                        return app;
+                    }).catch((err) => {
+                        console.log(err);
+                    });
             }
           }, null);
           return ret ? resolve(ret) : reject(new Error('could not find slack team app for matrix room id', room_id));
+        }
+      });
+    }
+
+    const getAndCacheAppFromMatrixUserId = (user_id) => {
+      return new Promise((resolve, reject) => {
+        let app = matrixUserAppMap[user_id];
+        if (app) {
+          return resolve(app);
+        } else {
+          let ret = teamAppList.reduce((acc, app)=>{
+            if ( acc ) return acc;
+            let slackUserId = app.getThirdPartyUserIdFromMatrixGhostId(user_id);
+            if (slackUserId) {
+                return app.client.getUserById(slackUserId)
+                    .then((user) => {
+                        debug('getting app from slack user');
+                        matrixUserAppMap[user_id] = app;
+                        return app;
+                    }).catch((err) => {
+                        console.log(err);
+                    });
+            }
+          }, null);
+          return ret ? resolve(ret) : reject(new Error('could not find slack team app for matrix user id', user_id));
         }
       });
     }
@@ -66,15 +96,33 @@ new Cli({
           return {}; // auto provision users w no additional data
         },
         onEvent: function(req, ctx) {
-          const { room_id } = req.getData();
-          debug('event in room id', room_id);
-          if (room_id) {
-            getAndCacheAppFromMatrixRoomId(room_id).then( app => {
+          let event = req.getData();
+          debug('event in room id', event.room_id);
+          if (event.room_id) {
+            return getAndCacheAppFromMatrixRoomId(event.room_id).then( app => {
               debug('got app from matrix room id');
               return app.handleMatrixEvent(req, ctx);
             }).catch(err=>{
               debug('could not get app for matrix room id');
-              console.error(err);
+              if (event.type === 'm.room.member') {
+                if (!event.content || !event.content.membership || !event.content.is_direct) {
+                  debug('ignoring unexpected event:', event);
+                  return;
+                }
+                if (event.content.membership === "invite") {
+                  return getAndCacheAppFromMatrixUserId(event.state_key).then(app => {
+                    debug('found app for matrix user id!');
+                    return app.initiateIm(event).then(() => {
+                      matrixRoomAppMap[event.room_id] = app;
+                      return app.handleMatrixEvent(req, ctx);
+                    }).catch((err) => {
+                      debug('error while initiating IM: ', err);
+                    });
+                  }).catch(err => {
+                    debug('could not get app for matrix user id: ', err);
+                  });
+                }
+              }
             });
           }
         },
